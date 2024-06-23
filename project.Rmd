@@ -1,0 +1,506 @@
+---
+title: "earthquake"
+author: "Ma Jiapeng"
+date: "2024-06-1"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## initial setting 
+```{r}
+library(ETAS.inlabru)
+library(ggplot2)
+num.cores <- 3
+future::plan(future::multisession, workers = num.cores)
+INLA::inla.setOption(num.threads = num.cores)
+```
+
+## generating synthetic catalogs
+```{r}
+set.seed(111)
+true.param <- list(mu = 0.30106014, K = 0.13611399, alpha = 2.43945301, c = 0.07098607, p = 1.17838741)
+beta.p <- 2.353157
+M0 <- 2.5
+T1 <- 0
+T2 <- 365
+
+# List of different historical events
+historical_events <- list(
+  H0 = data.frame(ts = mean(c(T1, T2)), magnitudes = 4.7),
+  H1 = data.frame(ts = mean(c(T1, T2)), magnitudes = 5),
+  H2 = data.frame(ts = mean(c(T1, T2)), magnitudes = 5.3),
+  H3 = data.frame(ts = mean(c(T1, T2)), magnitudes = 5.6),
+  H4 = data.frame(ts = mean(c(T1, T2)), magnitudes = 5.9),
+  H5 = data.frame(ts = mean(c(T1, T2)), magnitudes = 6.2),
+  H6 = data.frame(ts = mean(c(T1, T2)), magnitudes = 6.5)
+
+  
+)
+
+# Generate different synthetic catalogs for each set of historical events
+synthetic_catalogs <- lapply(historical_events, function(Ht) {
+  synth.cat.list <- generate_temporal_ETAS_synthetic(
+    theta = true.param,
+    beta.p = beta.p,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    Ht = Ht
+  )
+  do.call(rbind, synth.cat.list)
+})
+
+
+synth.cat.df.H1 <- synthetic_catalogs[[2]] # or  synthetic_catalogs$H1
+head(synth.cat.df.H1)
+
+
+```
+
+## plot the synthetic catalogs
+```{r}
+library(ggplot2)
+
+plot_list <- lapply(names(synthetic_catalogs), function(name) {
+  synth_cat_df <- synthetic_catalogs[[name]]
+  p <- ggplot(synth_cat_df, aes(ts, magnitudes)) +
+    geom_point() +
+    ggtitle(paste("Synthetic Catalog for", name)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 14, face = "bold"),  
+          axis.text = element_text(size = 14),                 
+          axis.title = element_text(size = 14))              
+
+  
+  print(p)
+})
+
+```
+
+## setting prior 
+```{r}
+# set copula transformations list
+link.f <- list(
+  mu = \(x) gamma_t(x, 0.3, 0.6),
+  K = \(x) unif_t(x, 0, 10),
+  alpha = \(x) unif_t(x, 0, 10),
+  c_ = \(x) unif_t(x, 0, 10),
+  p = \(x) unif_t(x, 1, 10)
+)
+
+# set inverse copula transformations list
+inv.link.f <- list(
+  mu = \(x) inv_gamma_t(x, 0.3, 0.6),
+  K = \(x) inv_unif_t(x, 0, 10),
+  alpha = \(x) inv_unif_t(x, 0, 10),
+  c_ = \(x) inv_unif_t(x, 0, 10),
+  p = \(x) inv_unif_t(x, 1, 10)
+)
+```
+
+## initial guess of parameteres
+```{r}
+# set up list of initial values
+th.init <- list(
+  th.mu = inv.link.f$mu(0.5),
+  th.K = inv.link.f$K(0.1),
+  th.alpha = inv.link.f$alpha(1),
+  th.c = inv.link.f$c_(0.1),
+  th.p = inv.link.f$p(1.1)
+)
+```
+
+
+## fit all these data
+```{r include=FALSE}
+library(ETAS.inlabru)
+library(ggplot2)
+
+# Set up the list of options and initial parameter values
+bru.opt.list <- list(
+  bru_verbose = 3, # Visual output level
+  bru_max_iter = 70, # Maximum number of iterations
+  bru_method = list(max_step = 0.5), # Maximum step for the optimization
+  bru_initial = th.init # Initial parameter estimates
+)
+
+# Generate and fit the model for each synthetic catalogue
+model_fits <- lapply(synthetic_catalogs, function(synth_cat.df) {
+  # Order the catalogue by occurrence time
+  ordered_synth_cat <- synth_cat.df[order(synth_cat.df$ts), ]
+  # Add event identifier
+  ordered_synth_cat$idx.p <- seq_len(nrow(ordered_synth_cat))
+
+  # Fit the ETAS model to the synthetic catalogue
+  Temporal.ETAS(
+    total.data = ordered_synth_cat,
+    M0 = M0,
+    
+    T1 = T1,
+    T2 = T2,
+    link.functions = link.f,
+    coef.t. = 1,
+    delta.t. = 0.1,
+    N.max. = 5,
+    bru.opt = bru.opt.list
+  )
+})
+
+
+
+```
+
+
+
+## after fitting
+```{r}
+
+alpha_samples <- list()  # lists to store alpha samples for plotting and post_samp for each catalog
+post_samples <- list()  # list to store the full post_samp for each catalog
+
+# Loop to extract post_samp and store alpha and post_samp separately
+for (i in seq_along(model_fits)) {
+  input_list <- list(
+    model.fit = model_fits[[i]],
+    link.functions = link.f
+  )
+  
+  # Extract post samples
+  post_samp <- post_sampling(
+    input.list = input_list,
+    n.samp = 1000,
+    max.batch = 1000,
+    ncore = 1
+  )
+  
+  # Store post_samp data for future use
+  post_samples[[i]] <- post_samp  # Store the entire post_samp
+  
+  # Store only alpha samples along with the catalog identifier for plotting
+  alpha_samples[[i]] <- data.frame(Alpha = post_samp$alpha, Catalog = paste("Catalog", i))
+}
+
+# Combine all alpha samples into a single dataframe for plotting
+alpha_df <- do.call(rbind, alpha_samples)
+
+# Plotting all alpha samples with the true alpha value line
+ggplot(alpha_df, aes(x = Alpha, fill = Catalog)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 2.43945301, color = "red", linetype = "dashed", size = 1) +
+  ggtitle("Combined Density Plot of Alpha Across All Catalogs") +
+  xlab("Alpha") +
+  ylab("Density") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")  
+
+
+
+```
+## Compute the error 
+```{r}
+# Compute the error
+true_alpha <- 2.43945301
+
+# Calculate MSE for each set of alpha samples previously collected
+mse_list <- sapply(alpha_samples, function(samples) {
+  mean((samples$Alpha - true_alpha)^2)
+})
+mse_list
+
+
+
+
+```
+## visualize the error 
+```{r}
+library(ggplot2)
+
+# Calculate counts of earthquakes greater than magnitude 4 for each catalog
+counts <- sapply(synthetic_catalogs, function(cat) {
+  sum(cat$magnitude > 4)
+})
+
+# Create a data frame that combines counts and MSE
+data_for_plot <- data.frame(
+  Count = counts,
+  MSE = mse_list
+)
+
+# Sort the data frame by the count of high magnitude events
+data_for_plot <- data_for_plot[order(data_for_plot$Count),]
+
+# Plotting MSE against the number of high magnitude events
+ggplot(data_for_plot, aes(x = Count, y = MSE)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "MSE vs. Number of High Magnitude Earthquake Events",
+       x = "Number of Earthquakes of Magnitude > 4",
+       y = "MSE of Alpha Estimation") +
+  theme_minimal()
+
+
+
+```
+
+## visualize the variance 
+```{r}
+
+
+# store variances for each set of alpha samples
+variance_list <- sapply(alpha_samples, function(samples) {
+  var(samples$Alpha)
+})
+# combine variance and count
+data_for_plot <- data.frame(
+  Count = counts,
+  Variance = variance_list
+)
+
+# Sort the data frame by the count of high magnitude events
+data_for_plot <- data_for_plot[order(data_for_plot$Count),]
+
+# Plotting variance against the number of high magnitude events
+ggplot(data_for_plot, aes(x = Count, y = Variance)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Variance of Alpha vs. Number of High Magnitude Earthquake Events",
+       x = "Number of Earthquakes > Magnitude 4",
+       y = "Variance of Alpha Estimation") +
+  theme_minimal()
+
+
+```
+
+
+## now go to the second part of this project, i.e. to measure the forecast accuracy 72 hours after the main(biggest) earthquake
+```{r}
+
+# express 1 minute in days for accuracy
+min.in.days <- 1 / (24 * 60)
+
+# Initialize an empty list to store forecast results
+forecast_results <- list()
+
+# Loop over each synthetic catalog and use its corresponding post_samp for forecasting
+for (i in seq_along(synthetic_catalogs)) {
+  # Find the time of the event with the greatest magnitude for each catalog
+  t.max.mag <- synthetic_catalogs[[i]]$ts[which.max(synthetic_catalogs[[i]]$magnitudes)]
+  
+  T1.fore <- t.max.mag + min.in.days
+  
+  # Set the forecast length to 72 days
+  fore.length <- 3
+  T2.fore <- T1.fore + fore.length
+  
+  # Use all known data up to the start of the forecast period
+  Ht.fore <- synthetic_catalogs[[i]][synthetic_catalogs[[i]]$ts < T1.fore, ]
+  
+  
+  # Produce forecast using the Temporal.ETAS.forecast function
+  daily.fore <- Temporal.ETAS.forecast(
+    post.samp = post_samples[[i]], # Use the specific post.samp for this catalog
+    n.cat = nrow(post_samples[[i]]), # Adjust the number of synthetic catalogues to the size of post_samp
+    beta.p = beta.p, # Magnitude distribution parameter
+    M0 = M0, # Cutoff magnitude
+    T1 = T1.fore, # Forecast starting time
+    T2 = T2.fore, # Forecast end time
+    Ht = Ht.fore, # Known events before the forecast period
+    ncore = num.cores # Number of cores for parallel computation
+  )
+  
+  forecast_results[[i]] <- daily.fore
+  N.true.general <- sum(synthetic_catalogs[[i]]$ts >= T1.fore & synthetic_catalogs[[i]]$ts <= T2.fore)
+  N.true.significant <- sum(synthetic_catalogs[[i]]$magnitudes > 4 & synthetic_catalogs[[i]]$ts >= T1.fore & synthetic_catalogs[[i]]$ts <= T2.fore) 
+  forecast_results[[i]]$N_true_general <- N.true.general
+  forecast_results[[i]]$N_true_significant <- N.true.significant
+}
+
+
+```
+
+## plot an example to illustrate the forecast period 
+```{r}
+library(ggplot2)
+
+# Synthetic Catalog data
+synth_cat_df <- synthetic_catalogs[[7]]
+
+# Example start date for the rectangle and duration
+startDate <- synth_cat_df$ts[which.max(synth_cat_df$magnitudes)]  # Time of the largest magnitude earthquake
+min.in.days <- 1 / (24 * 60)  # One minute in days
+T1.fore <- startDate + min.in.days  # Start time + 1 minute
+fore.length <- 3  # Forecast length in days
+T2.fore <- T1.fore + fore.length  # End time of the forecast period
+
+# Calculate the index of the maximum magnitude event
+max_mag_index <- which.max(synth_cat_df$magnitudes)
+
+# Plotting
+p <- ggplot(synth_cat_df, aes(x = ts, y = magnitudes)) +
+  geom_point(color = "black", size = 0.1) +  
+  geom_point(data = synth_cat_df[max_mag_index, ], aes(x = ts, y = magnitudes), color = "red", size = 1.5) +  
+  geom_rect(aes(xmin = T1.fore, xmax = T2.fore, ymin = min(magnitudes), ymax = max(magnitudes)),
+            fill = "blue", alpha = 0.002, inherit.aes = FALSE) +  
+  ggtitle("Synthetic Catalog 6") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 14, face = "bold"),  
+        axis.text = element_text(size = 14, face = "bold"),                
+        axis.title = element_text(size = 14, face = "bold"))     
+# Print the plot in the R console
+print(p)
+```
+
+## first do the number of earthquake plot test
+```{r}
+library(ggplot2)
+
+# Loop over each element in forecast_results to plot
+plot_list <- lapply(seq_along(forecast_results), function(idx) {
+  daily_fore <- forecast_results[[idx]]
+  
+  # Number of events per catalogue
+  N.fore <- vapply(
+    seq_len(daily_fore$n.cat),
+    \(x) sum(daily_fore$fore.df$cat.idx == x),
+    numeric(1)
+  )
+  
+  # Number of observed events in the forecasting period
+  N.true <- daily_fore$N_true_general
+  
+  # Create the histogram plot
+  ggplot() +
+    geom_histogram(aes(x = N.fore, y = after_stat(density)), binwidth = 1) +
+    geom_vline(xintercept = N.true, color = "red", size = 1.25) +
+    xlim(0, 1000) +
+    ggtitle(sprintf("Forecast Results for Catalog %d", idx - 1))  
+})
+
+invisible(lapply(plot_list, print))
+
+
+```
+
+## do the assessment 
+
+## Do the recapped 'N-test'
+```{r}
+# Initialize an empty list to store the results
+results_list <- list()
+
+calculate_capped_error <- function(obs, exp, cap = 2) {
+  errors <- abs((obs - exp) / exp)
+  errors[errors > cap] <- cap
+  mean(errors)
+}
+# Loop over each dataframe in the forecast_results list
+for (i in 1:length(forecast_results)) {
+  df <- forecast_results[[i]]
+  
+  # Initialize a vector to store the observed counts
+  N_obs_general <- integer(1000)  
+  N_obs_significant <- integer(1000)
+  # Loop over each catalog index
+  for (j in 1:1000) {
+    # Filter events with magnitudes greater than 4 and count them
+    N_obs_significant[j] <- sum(df$fore.df$magnitudes[df$fore.df$cat.idx == j] > 4) 
+    N_obs_general[j] <- sum(df$fore.df$cat.idx == j)
+  }
+  
+  # Compute the expected number of events (N_exp) for the synthetic data corresponding to this dataframe
+  N_exp_significant <- forecast_results[[i]]$N_true_significant
+  
+  N_exp_general <- forecast_results[[i]]$N_true_general
+  
+  
+  # this kind of uncapped relative error will be sensitive to extreme value, making the total error exceed 1
+  #error_general <- mean(abs((N_obs_general - N_exp_general) / N_exp_general))
+  #error_significant <- mean(abs((N_obs_significant - N_exp_significant) / N_exp_significant))
+  
+  
+  
+  # Compute the relative error
+  error_general <- calculate_capped_error(N_obs_general, N_exp_general)
+  error_significant <- calculate_capped_error(N_obs_significant, N_exp_significant)
+
+  
+  # Store the results in the list
+  results_list[[i]] <- list(
+    N_obs_general = N_obs_general, 
+    N_obs_significant = N_obs_significant, 
+    N_exp_general = N_exp_general, 
+    N_exp_significant = N_exp_significant, 
+    error_general = error_general, 
+    error_significant = error_significant
+  )
+}
+
+str(results_list)
+
+
+
+```
+
+## plot the error
+```{r}
+library(ggplot2)
+library(reshape2)  # Load reshape2 for data transformation
+
+# Create a data frame from results_list for plotting
+catalog_errors <- data.frame(
+  catalog = seq_along(results_list),
+  error_general = sapply(results_list, function(item) item$error_general),
+  error_significant = sapply(results_list, function(item) item$error_significant)
+)
+
+# Removing any NA values to avoid issues in plotting
+catalog_errors <- na.omit(catalog_errors)
+
+# Reshape data from wide to long format to use in ggplot
+catalog_errors_long <- melt(catalog_errors, id.vars = "catalog", variable.name = "error_type", value.name = "error_value")
+
+# Create a combined bar chart with enhanced aesthetics
+ggplot(catalog_errors_long, aes(x = as.factor(catalog), y = error_value, fill = error_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("error_general" = "#1f77b4", "error_significant" = "#ff7f0e")) +  
+  labs(title = "Error Comparison by Synthetic Catalog",
+       x = "Catalog Number",
+       y = "Relative Error",
+       fill = "Error Type") +
+  theme_minimal(base_size = 14) +  
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    axis.title = element_text(size = 16, face = "bold"),
+    title = element_text(size = 18, face = "bold"),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "#e5e5e5"),  
+    panel.grid.minor = element_blank(),  
+    plot.background = element_rect(fill = "white", color = NA),  
+    legend.background = element_rect(fill = "white", color = NA)  
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
